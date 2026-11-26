@@ -16,36 +16,12 @@ Output legend:   * key : value   (orig: original value)
   (orig: same)   value equals the original
   (orig: -)      the key does not exist in the parent chain
   (orig: ?)      the parent profile could not be found
-
-Version: The script reads it from ~/.config/OrcaSlicer/OrcaSlicer.conf and prints the result on startup, 
-for example OrcaSlicer version: 2.5.2 (detected from OrcaSlicer.conf). 
-If detection fails, it uses FALLBACK_VERSION = "2.5.2" near the top of the script. 
-You can also force a version with orca-changes --version 2.5.2. 
-
-What happens on the first run:
-
-It makes a small clone of the OrcaSlicer repository at /tmp/orca-src. 
-The clone has no checkout and no file contents, so it is small. It exists only to look files up.
-It lists which profiles exist for your version and saves that list.
-For each profile in the inherits chain, it downloads just that file and prints (fetching …). Your example needed three files.
-The files are cached in ~/.config/orca-src/<version>/, in the same folder layout as the repository.
-
-Later runs: If the profiles you look at are already cached, the script uses no network and no git. 
-/tmp/orca-src is only recreated when a new file has to be downloaded, for example after a reboot clears /tmp.
-
-Updating OrcaSlicer: A new version gets its own cache folder, so the original values always match your installed version. 
-Old version folders can be deleted by hand.
-
-If anything fails (no network, git missing, version tag not found), 
-the script prints the reason and shows (orig: ?) instead of crashing.
-
-Yours
-Claude
-20261126
+Metadata keys (name, inherits, from, ...) are shown but never counted as changes.
 """
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -64,19 +40,34 @@ CACHE_DIR = Path.home() / ".config" / "orca-src"        # permanent cache of nee
 PREFIX = "resources/profiles/"                          # profile folder inside the repo
 
 MAX_LEN = 100  # truncate long values (e.g. G-code) in the display
+GIT_TIMEOUT = 120  # seconds
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+[A-Za-z0-9._-]*")
+META_KEYS = {"name", "inherits", "from", "setting_id", "base_id", "version",
+             "is_custom_defined"}  # shown, but not counted as user changes
 
 
 # --------------------------------------------------------------------------- git / cache
 
 def git(*args, cwd=None):
     try:
-        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True)
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                           timeout=GIT_TIMEOUT)
     except FileNotFoundError:
         raise RuntimeError("git is not installed")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git {' '.join(args[:2])} timed out after {GIT_TIMEOUT} s")
     if r.returncode:
         err = r.stderr.decode(errors="replace").strip()
         raise RuntimeError(f"git {' '.join(args[:2])} failed: {err}")
     return r.stdout
+
+
+def write_atomic(path, data):
+    """Write via a temp file + rename so an interrupted run leaves no partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data.encode("utf-8") if isinstance(data, str) else data)
+    os.replace(tmp, path)
 
 
 def ensure_clone(version):
@@ -105,7 +96,7 @@ class ProfileStore:
             return
         tree_file = self.root / "_tree.txt"
         if tree_file.exists():
-            paths = tree_file.read_text(encoding="utf-8").split("\n")
+            paths = [p for p in tree_file.read_text(encoding="utf-8").split("\n") if p]
         else:
             ensure_clone(self.version)
             out = git("ls-tree", "-r", "-z", "--name-only", "HEAD", PREFIX.rstrip("/"),
@@ -114,8 +105,7 @@ class ProfileStore:
                      if p.startswith(PREFIX) and p.endswith(".json")]
             if not paths:
                 raise RuntimeError(f"no profiles found for v{self.version}")
-            self.root.mkdir(parents=True, exist_ok=True)
-            tree_file.write_text("\n".join(paths), encoding="utf-8")
+            write_atomic(tree_file, "\n".join(paths))
         index = {}
         for p in paths:
             parts = p.split("/")
@@ -138,8 +128,7 @@ class ProfileStore:
             ensure_clone(self.version)
             print(f"(fetching {rel})")
             data = git("show", f"HEAD:{PREFIX}{rel}", cwd=CLONE_DIR)
-            local.parent.mkdir(parents=True, exist_ok=True)
-            local.write_bytes(data)
+            write_atomic(local, data)
         return load_json(local)
 
 
@@ -169,14 +158,14 @@ def load_json(path):
 
 def resolve_chain(store, name, category, prefer_vendor=None, seen=frozenset()):
     """Return (merged_dict, found) for a system profile incl. all its ancestors."""
-    if name in seen:  # guard against inheritance cycles
-        return {}, True
+    if name in seen:  # inheritance cycle: treat as unresolvable
+        return {}, False
     rel = store.find(category, name, prefer_vendor)
     if rel is None:
         return {}, False
     try:
         data = store.get(rel)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):  # unreadable file, bad encoding, bad JSON
         return {}, False
 
     base, found = {}, True
@@ -205,8 +194,7 @@ def choose(title, options):
 
 
 def fmt(value):
-    text = json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) \
-        else str(value)
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     text = text.replace("\n", "\\n")
     return text if len(text) <= MAX_LEN else text[:MAX_LEN - 1] + "…"
 
@@ -236,7 +224,8 @@ def show_file(path, store, category):
             original, found = resolve_chain(store, parent, category)
             if not found:
                 print(f"(parent profile '{parent}' not found in OrcaSlicer v{store.version})")
-        except RuntimeError as e:
+        except (OSError, ValueError, RuntimeError) as e:
+            original, found = {}, False
             print(f"(could not get system profiles: {e})")
 
     width = max((len(k) for k in data), default=0)
@@ -246,17 +235,19 @@ def show_file(path, store, category):
             orig_txt, mark = "?", " "
         elif key not in original:
             orig_txt, mark = "-", "*"
-            changed += 1
         elif same(value, original[key]):
             orig_txt, mark = "same", " "
         else:
             orig_txt, mark = fmt(original[key]), "*"
+        if key in META_KEYS:
+            mark = " "
+        elif mark == "*":
             changed += 1
         print(f"{mark} {key:<{width}} : {fmt(value)}   (orig: {orig_txt})")
 
     summary = f"\n{len(data)} keys"
     if found:
-        summary += f", {changed} differ from the original (marked *)"
+        summary += f", {changed} settings differ from the original (marked *)"
     print(summary)
 
 
@@ -267,16 +258,20 @@ def main():
     ap.add_argument("--version", help="OrcaSlicer version, e.g. 2.5.2 (default: autodetect)")
     args = ap.parse_args()
 
-    base = args.base.expanduser()
+    base = args.base.expanduser().resolve()
     if not base.is_dir():
         sys.exit(f"Directory not found: {base}")
 
     if args.version:
         version, how = args.version.lstrip("v"), "from --version"
-    elif (detected := detect_version(base.parents[1])):
-        version, how = detected, "detected from OrcaSlicer.conf"
+        if not VERSION_RE.fullmatch(version):
+            sys.exit(f"Invalid version '{args.version}' (expected e.g. 2.5.2)")
     else:
-        version, how = FALLBACK_VERSION, "fallback, could not detect"
+        detected = detect_version(base.parents[1]) if len(base.parents) > 1 else None
+        if detected and VERSION_RE.fullmatch(detected):
+            version, how = detected, "detected from OrcaSlicer.conf"
+        else:
+            version, how = FALLBACK_VERSION, "fallback, could not detect"
     print(f"OrcaSlicer version: {version} ({how})")
     store = ProfileStore(version)
 
@@ -286,7 +281,8 @@ def main():
             break
         category = CATEGORIES[idx]
         folder = base / category
-        files = sorted(folder.glob("*.json")) if folder.is_dir() else []
+        files = sorted(folder.glob("*.json"), key=lambda f: f.name.lower()) \
+                if folder.is_dir() else []
         if not files:
             print(f"No .json files in {folder}")
             continue
