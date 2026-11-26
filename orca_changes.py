@@ -21,7 +21,6 @@ Version: The script reads it from ~/.config/OrcaSlicer/OrcaSlicer.conf and print
 for example OrcaSlicer version: 2.5.2 (detected from OrcaSlicer.conf). 
 If detection fails, it uses FALLBACK_VERSION = "2.5.2" near the top of the script. 
 You can also force a version with orca-changes --version 2.5.2. 
-I only tested the detection against a made-up .conf, so check that the printed version matches your real install.
 
 What happens on the first run:
 
